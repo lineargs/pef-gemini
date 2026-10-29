@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import secrets
+import ssl
 import time
 from typing import Any
 import urllib.error
@@ -57,6 +58,18 @@ DEFAULT_ESCALATION_MODEL = ""
 # First-pass phishing probability band that escalates. A starting heuristic: tune it
 # with tools/evaluate.py.
 ESCALATION_BAND = (0.20, 0.88)
+# A failed escalation is retried once (timeouts, 429, 5xx), then Flash's verdict stands.
+ESCALATION_ATTEMPTS = 2
+ESCALATION_RETRY_DELAY_S = 1.0
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Timeouts, rate limits and server errors are worth retrying; bad requests are not."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int) and (code == 429 or code >= 500):
+        return True
+    name = type(exc).__name__
+    return name in ("ServerError", "TimeoutError") or "Timeout" in name or "DEADLINE_EXCEEDED" in str(exc)
 MAX_TEXT_CHARS = 32_000
 
 SYSTEM_INSTRUCTION = """You are an expert cybersecurity email analyst for the Phishing Email Framework (PEF v2).
@@ -99,7 +112,13 @@ def _get_genai_client() -> Any:
                 "Local Quickstart)."
             ) from exc
 
-        _genai_client = genai.Client()
+        from google.genai import types
+
+        # Without a timeout, one stuck HTTP request would hang until the function's own
+        # timeout (or forever in tools/evaluate.py). The default keeps a Flash call plus
+        # an escalation inside the 120 s function timeout set by deploy.sh.
+        timeout_ms = int(float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "55")) * 1000)
+        _genai_client = genai.Client(http_options=types.HttpOptions(timeout=timeout_ms))
     return _genai_client
 
 
@@ -285,6 +304,27 @@ def _query_safe_browsing_matches(urls_to_check: list[str]) -> tuple[set[str], st
 SAFE_BROWSING_BATCH_SIZE = 500  # Lookup API maximum threatEntries per request
 
 
+_TLS_CONTEXT: ssl.SSLContext | None = None
+
+
+def _tls_context() -> ssl.SSLContext:
+    """TLS context for the Safe Browsing call, trusting certifi's CA bundle when available.
+
+    Cloud Run's image has system CA certificates, but the python.org installer on macOS
+    does not, so urllib fails with CERTIFICATE_VERIFY_FAILED when the simulator or
+    evaluate.py runs locally. certifi ships with google-genai's dependencies.
+    """
+    global _TLS_CONTEXT
+    if _TLS_CONTEXT is None:
+        try:
+            import certifi
+
+            _TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            _TLS_CONTEXT = ssl.create_default_context()
+    return _TLS_CONTEXT
+
+
 def _safe_browsing_lookup(api_key: str, urls: list[str]) -> set[str]:
     endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
     body = {
@@ -307,7 +347,7 @@ def _safe_browsing_lookup(api_key: str, urls: list[str]) -> set[str]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=5.0) as resp:
+    with urllib.request.urlopen(req, timeout=5.0, context=_tls_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     matches = data.get("matches", [])
     matched_urls = {
@@ -546,6 +586,7 @@ def analyze_with_gemini_detailed(
     used. If the escalation call fails, the first-pass result is kept and the failure is
     recorded in `calls`, so a borderline email is never stuck on the bigger model.
     """
+    started = time.monotonic()
     if client is None:
         client = _get_genai_client()
 
@@ -595,24 +636,40 @@ def analyze_with_gemini_detailed(
         primary_model,
         escalation_model,
     )
-    try:
-        escalated, escalation_usage = _invoke_gemini_model(
-            client=client,
-            model_name=escalation_model,
-            escaped_prompt=escaped_prompt,
-            thinking_level=escalation_thinking,
-        )
-    except Exception as exc:  # noqa: BLE001 - escalation is best effort
-        logger.warning(
-            "Escalation to %s failed (%s); keeping the %s result.",
-            escalation_model,
-            type(exc).__name__,
-            primary_model,
-        )
-        calls.append(
-            {"model": escalation_model, "thinkingLevel": escalation_thinking, "error": type(exc).__name__}
-        )
-        return GeminiRun(result=result, calls=calls)
+    timeout_s = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "55"))
+    budget_s = float(os.environ.get("PEF_ANALYSIS_BUDGET_SECONDS", "110"))
+    for attempt in range(1, ESCALATION_ATTEMPTS + 1):
+        try:
+            escalated, escalation_usage = _invoke_gemini_model(
+                client=client,
+                model_name=escalation_model,
+                escaped_prompt=escaped_prompt,
+                thinking_level=escalation_thinking,
+            )
+            break
+        except Exception as exc:  # noqa: BLE001 - escalation is best effort
+            # Retry once on a timeout, rate limit or server error, but only if a full
+            # second attempt still fits in the analysis budget (below the function timeout).
+            fits = time.monotonic() - started + timeout_s + ESCALATION_RETRY_DELAY_S <= budget_s
+            if attempt < ESCALATION_ATTEMPTS and is_transient_error(exc) and fits:
+                logger.info(
+                    "Escalation to %s failed (%s); retrying once.", escalation_model, type(exc).__name__
+                )
+                time.sleep(ESCALATION_RETRY_DELAY_S)
+                continue
+            logger.warning(
+                "Escalation to %s failed (%s); keeping the %s result.",
+                escalation_model,
+                type(exc).__name__,
+                primary_model,
+            )
+            failed = {"model": escalation_model, "thinkingLevel": escalation_thinking, "error": type(exc).__name__}
+            if attempt > 1:
+                failed["attempts"] = attempt
+            calls.append(failed)
+            return GeminiRun(result=result, calls=calls)
+    if attempt > 1:
+        escalation_usage["attempts"] = attempt
     calls.append(escalation_usage)
     return GeminiRun(result=escalated, calls=calls)
 

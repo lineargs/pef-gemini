@@ -31,8 +31,11 @@ env_vars.yaml
 # Evaluation runs can contain content from private mailboxes.
 # Publish a run deliberately: git add -f evals/results/<run_id>.*
 evals/results/
+# Downloaded evaluation corpora (public datasets; download them yourself, see README).
+evals/data/
 
-# OS / IDE
+# OS / IDE / CM
 .DS_Store
 .idea/
 .vscode/
+.cm_project

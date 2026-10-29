@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import ssl
 import sys
 from typing import Any, Callable
 import urllib.error
@@ -31,7 +32,18 @@ STATE_KINDS = ("OAuthToken", "OAuthState", "MailboxWatchState", "emailNotificati
 AUDIT_KIND = "EmailAuditLog"
 
 
-def revoke_token(token: str, opener: Callable[..., Any] = urllib.request.urlopen) -> bool:
+def _urlopen(req: urllib.request.Request, timeout: float) -> Any:
+    """urlopen that trusts certifi's CA bundle when available (python.org macOS builds lack one)."""
+    try:
+        import certifi
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        context = ssl.create_default_context()
+    return urllib.request.urlopen(req, timeout=timeout, context=context)
+
+
+def revoke_token(token: str, opener: Callable[..., Any] = _urlopen) -> bool:
     """Revoke a refresh or access token. Returns True if Google accepted it or it was already invalid."""
     data = urllib.parse.urlencode({"token": token}).encode()
     req = urllib.request.Request(REVOKE_URL, data=data, method="POST",

@@ -313,6 +313,8 @@ class TestPEFPipeline(unittest.TestCase):
             self.assertFalse(domain_hit)
             self.assertTrue(links_hit)
             self.assertEqual(mock_urlopen.call_count, 1)
+            # urlopen gets an explicit TLS context (certifi's bundle), so python.org builds on macOS work
+            self.assertIsNotNone(mock_urlopen.call_args.kwargs.get("context"))
             self.assertTrue(check_safe_browsing(["https://phish.test/login"]))
 
     def test_gemini_config_uses_response_schema_low_thinking_and_escapes_delimiters(

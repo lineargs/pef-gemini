@@ -360,6 +360,28 @@ class TestAnalyzeStage(unittest.TestCase):
             {"promptTokens": 812, "outputTokens": 164, "thinkingTokens": 233, "totalTokens": 1209},
         )
 
+    def test_evaluate_retries_transient_errors_only(self) -> None:
+        from tools import evaluate as ev
+
+        class ServerError(Exception):
+            code = 504
+
+        self.assertTrue(ev.is_transient(ServerError("504 DEADLINE_EXCEEDED")))
+        self.assertTrue(ev.is_transient(TimeoutError()))
+        bad_request = ValueError("400 INVALID_ARGUMENT")
+        self.assertFalse(ev.is_transient(bad_request))
+
+    def test_genai_client_has_a_request_timeout(self) -> None:
+        try:
+            from google.genai import types  # noqa: F401
+        except ImportError:
+            self.skipTest("google-genai not installed")
+        with mock.patch("google.genai.Client") as client_cls, mock.patch.object(analyze_main, "_genai_client", None), \
+                mock.patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "30"}):
+            analyze_main._get_genai_client()
+        http_options = client_cls.call_args.kwargs["http_options"]
+        self.assertEqual(http_options.timeout, 30_000)
+
     def test_escalation_thinking_level_defaults_to_low(self) -> None:
         client = mock.MagicMock()
         client.models.generate_content.side_effect = [
@@ -395,6 +417,39 @@ class TestAnalyzeStage(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             analyze_main.analyze_with_gemini_detailed({"body": "x"}, client=client)
         self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_transient_escalation_failure_is_retried_once(self) -> None:
+        class ServerError(Exception):
+            code = 503
+
+        client = mock.MagicMock()
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(parsed=_phish_result(0.50), text="{}"),
+            ServerError("503 UNAVAILABLE"),
+            SimpleNamespace(parsed=_phish_result(0.96), text="{}"),
+        ]
+        with mock.patch.dict(os.environ, {"GEMINI_ESCALATION_MODEL": "gemini-4-argon"}), \
+                mock.patch.object(analyze_main, "ESCALATION_RETRY_DELAY_S", 0):
+            run = analyze_main.analyze_with_gemini_detailed({"body": "x"}, client=client)
+        self.assertEqual(run.result.overall_confidence, 0.96)  # the retried escalation decided
+        self.assertEqual(run.models, ["gemini-3.8-flash", "gemini-4-argon"])
+        self.assertEqual(run.calls[1]["attempts"], 2)
+
+    def test_escalation_retry_skipped_when_it_would_not_fit_the_budget(self) -> None:
+        class ServerError(Exception):
+            code = 504
+
+        client = mock.MagicMock()
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(parsed=_phish_result(0.50), text="{}"),
+            ServerError("504 DEADLINE_EXCEEDED"),
+        ]
+        env = {"GEMINI_ESCALATION_MODEL": "gemini-4-argon", "PEF_ANALYSIS_BUDGET_SECONDS": "30"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(analyze_main, "ESCALATION_RETRY_DELAY_S", 0), \
+                self.assertLogs(analyze_main.logger, level="WARNING"):
+            run = analyze_main.analyze_with_gemini_detailed({"body": "x"}, client=client)
+        self.assertEqual(client.models.generate_content.call_count, 2)  # no second escalation
+        self.assertEqual(run.result.overall_confidence, 0.50)
 
     def test_failed_escalation_keeps_first_pass_result(self) -> None:
         client = mock.MagicMock()

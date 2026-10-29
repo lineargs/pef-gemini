@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 import sys
 import time
@@ -264,6 +265,10 @@ def run_single_email(raw_email: dict[str, Any], mode: str) -> dict[str, Any]:
     if mode == "local":
         print(f"{ANSI_BOLD}Models:{ANSI_RESET}   {' -> '.join(models_used)}")
     print(
+        f"{ANSI_BOLD}Phishing probability:{ANSI_RESET} {analysis.overall_confidence:.2f}  "
+        f"(is_phishing={analysis.is_phishing}; 0.20 to 0.88 escalates)"
+    )
+    print(
         f"{ANSI_BOLD}Propositions Triggered:{ANSI_RESET} "
         f"{', '.join(active_props) if active_props else 'None'}"
     )
@@ -293,6 +298,9 @@ def run_single_email(raw_email: dict[str, Any], mode: str) -> dict[str, Any]:
 
 
 def main() -> None:
+    # Keep per-request HTTP log lines out of the demo output.
+    for noisy in ("httpx", "google_genai", "google_genai.models"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(
         description="PEF v2 pipeline simulator (Cloud Run Functions + Pub/Sub + Gemini 3.8 Flash)"
     )

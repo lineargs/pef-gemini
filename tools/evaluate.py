@@ -29,9 +29,11 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -48,6 +50,7 @@ from functions.email_analyze.main import (  # noqa: E402
     analyze_with_gemini_detailed,
     check_reputation,
     compute_composite_score,
+    is_transient_error,
 )
 from functions.email_ingest.main import build_analysis_payload  # noqa: E402
 from functions.email_outcome.main import (  # noqa: E402
@@ -95,6 +98,14 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"Item {i} has no usable expectedVerdict/label: {item.get('id')}")
         emails.append({**item, "expectedVerdict": expected, "id": item.get("id") or f"item-{i}"})
     return emails
+
+
+RETRY_BACKOFF_SECONDS = (2, 8)
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Same rule as the pipeline: timeouts, rate limits and server errors are retried."""
+    return is_transient_error(exc)
 
 
 # ------------------------------------------------------------------------ metrics
@@ -271,6 +282,9 @@ def build_summary(all_rows: list[dict[str, Any]], meta: dict[str, Any], sweep: b
             lines.append(f"- `{row['id']}`: {row['error'][:200]}")
         if errors:
             lines.append("")
+    retried = sum(1 for row in rows if (row.get("attempts") or 1) > 1 and row.get("verdict") != "Error")
+    if retried:
+        lines += [f"> {retried} email(s) succeeded after a retry (timeout, rate limit or server error).", ""]
     if n < SMALL_SAMPLE_WARNING:
         lines += [
             f"> N = {n} is too small for accuracy claims; the intervals below show how wide "
@@ -365,6 +379,9 @@ def build_summary(all_rows: list[dict[str, Any]], meta: dict[str, Any], sweep: b
 
 
 def main() -> None:
+    # The pipeline modules log at INFO; keep per-request HTTP chatter out of the progress lines.
+    for noisy in ("httpx", "google_genai", "google_genai.models"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=["local", "offline"], default="local")
     parser.add_argument("--dataset", type=Path, default=SAMPLE_EMAILS_PATH)
@@ -372,6 +389,8 @@ def main() -> None:
     parser.add_argument("--with-reputation", action="store_true", help="Also call Safe Browsing (needs SAFE_BROWSING_API_KEY).")
     parser.add_argument("--sweep", action="store_true", help="Add a cut-off sweep to the summary.")
     parser.add_argument("--limit", type=int, default=0, help="Only evaluate the first N emails.")
+    parser.add_argument("--retries", type=int, default=2, help="Retries per email after a timeout, 429 or 5xx (default 2).")
+    parser.add_argument("--workers", type=int, default=1, help="Emails analysed in parallel (e.g. 8 for a few hundred emails). Default 1.")
     parser.add_argument("--prices", help="JSON price overrides, e.g. '{\"gemini-3.8-flash\": {\"input\": 1.5, \"output\": 7.5}}'.")
     parser.add_argument("--replay", type=Path, help="Recompute the summary from a saved .jsonl run.")
     args = parser.parse_args()
@@ -425,31 +444,57 @@ def main() -> None:
     else:
         meta["models"] = ["offline-stub"]
 
-    # Rows are written as they complete, so an interrupted or failing run keeps
-    # every result already paid for. Per-email errors are recorded, not fatal.
     rows = []
     jsonl_path = args.out / f"{run_id}.jsonl"
-    with jsonl_path.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"meta": meta}) + "\n")
-        fh.flush()
-        for i, email in enumerate(emails, start=1):
+
+    def run_one(email: dict[str, Any]) -> dict[str, Any]:
+        # Transient errors (timeouts, 429, 5xx) are retried with backoff, as Pub/Sub
+        # redelivery would retry them in production; anything else is recorded at once.
+        for attempt in range(args.retries + 1):
             try:
                 row = evaluate_email(email, args.mode, args.with_reputation, prices)
-                mark = "ok " if row["verdict"] == row["expected"] else "MISS"
+                row["attempts"] = attempt + 1
+                return row
             except Exception as exc:  # noqa: BLE001 - record and continue
-                row = {
+                if attempt < args.retries and is_transient(exc):
+                    time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)])
+                    continue
+                return {
                     "id": email["id"],
                     "expected": email["expectedVerdict"],
                     "verdict": "Error",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "attempts": attempt + 1,
                     "calls": [],
                     "costUsd": None,
                 }
-                mark = "ERR "
-            rows.append(row)
-            fh.write(json.dumps(row) + "\n")
-            fh.flush()
-            print(f"[{i}/{len(emails)}] {mark} {row['id']}: {row['verdict']} (expected {row['expected']})", file=sys.stderr)
+        raise AssertionError("unreachable")
+
+    # Rows are written as they complete, so an interrupted or failing run keeps
+    # every result already paid for. Per-email errors are recorded, not fatal.
+    with jsonl_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"meta": meta}) + "\n")
+        fh.flush()
+        # Only this thread writes; workers just analyse. Ctrl-C stops waiting and still
+        # writes the summary for every email finished so far.
+        pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+        futures = [pool.submit(run_one, email) for email in emails]
+        try:
+            for i, future in enumerate(as_completed(futures), start=1):
+                row = future.result()
+                if row["verdict"] == "Error":
+                    mark = "ERR "
+                else:
+                    mark = "ok " if row["verdict"] == row["expected"] else "MISS"
+                rows.append(row)
+                fh.write(json.dumps(row) + "\n")
+                fh.flush()
+                print(f"[{i}/{len(emails)}] {mark} {row['id']}: {row['verdict']} (expected {row['expected']})", file=sys.stderr)
+        except KeyboardInterrupt:
+            print(f"\nInterrupted: summarising the {len(rows)} of {len(emails)} emails that finished "
+                  "(a request still in flight ends within its GEMINI_TIMEOUT_SECONDS timeout).", file=sys.stderr)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     summary = build_summary(rows, meta, args.sweep)
     summary_path = args.out / f"{run_id}.summary.md"
