@@ -81,7 +81,7 @@ store_secret() {
   local name="$1" value="$2"
   gcloud services enable secretmanager.googleapis.com --project="${PROJECT}" \
     --billing-project="${PROJECT}" --quiet >/dev/null
-  if gcloud secrets describe "${name}" --project="${PROJECT}" >/dev/null 2>&1; then
+  if gcloud secrets describe "${name}" --project="${PROJECT}" --quiet >/dev/null 2>&1; then
     printf '%s' "${value}" | gcloud secrets versions add "${name}" --data-file=- \
       --project="${PROJECT}" --quiet >/dev/null
   else
@@ -109,12 +109,17 @@ current_project="$(get_env GOOGLE_CLOUD_PROJECT)"
 if is_unset "${current_project}"; then current_project="$(gcloud config get-value project 2>/dev/null || true)"; fi
 PROJECT="$(ask "Google Cloud project ID" "${current_project}")"
 [[ -n "${PROJECT}" ]] || die "A project ID is required."
-gcloud projects describe "${PROJECT}" --format='value(projectNumber)' >/dev/null 2>&1 \
+gcloud projects describe "${PROJECT}" --format='value(projectNumber)' --quiet >/dev/null 2>&1 \
   || die "Can't access project '${PROJECT}' as ${ACCOUNT}. Check the ID, or create it first."
 set_env GOOGLE_CLOUD_PROJECT "${PROJECT}"
 
+# Checking billing needs the Cloud Billing API on the project; enable it quietly first.
+# Every call that hides its output also passes --quiet: otherwise gcloud can stop at an
+# invisible "enable this API? (y/N)" prompt and the script appears to hang.
+gcloud services enable cloudbilling.googleapis.com --project="${PROJECT}" \
+  --billing-project="${PROJECT}" --quiet >/dev/null 2>&1 || true
 BILLING="$(gcloud billing projects describe "${PROJECT}" --billing-project="${PROJECT}" \
-  --format='value(billingEnabled)' 2>/dev/null || true)"
+  --format='value(billingEnabled)' --quiet 2>/dev/null || true)"
 if [[ "${BILLING}" != "True" ]]; then
   note "WARNING: couldn't confirm billing is enabled on ${PROJECT}. Cloud Run functions need it:"
   note "https://console.cloud.google.com/billing/linkedaccount?project=${PROJECT}"
@@ -209,7 +214,7 @@ if ask_yn "Turn on the Safe Browsing check?" y; then
     gcloud services enable safebrowsing.googleapis.com apikeys.googleapis.com \
       --project="${PROJECT}" --billing-project="${PROJECT}" --quiet >/dev/null
     KEY_RESOURCE="$(gcloud services api-keys list --project="${PROJECT}" --billing-project="${PROJECT}" \
-      --filter="displayName=${SB_KEY_NAME}" --format='value(name)' --limit=1)"
+      --filter="displayName=${SB_KEY_NAME}" --format='value(name)' --limit=1 --quiet)"
     if [[ -z "${KEY_RESOURCE}" ]]; then
       note "Creating API key '${SB_KEY_NAME}', restricted to the Safe Browsing API..."
       # gcloud prints the new key in its result; keep it off the screen unless creation fails.
@@ -220,13 +225,13 @@ if ask_yn "Turn on the Safe Browsing check?" y; then
         die "Could not create the API key."
       fi
       KEY_RESOURCE="$(gcloud services api-keys list --project="${PROJECT}" --billing-project="${PROJECT}" \
-        --filter="displayName=${SB_KEY_NAME}" --format='value(name)' --limit=1)"
+        --filter="displayName=${SB_KEY_NAME}" --format='value(name)' --limit=1 --quiet)"
       [[ -n "${KEY_RESOURCE}" ]] || die "The API key was created but can't be found; re-run ./setup.sh."
     else
       note "Reusing the existing API key '${SB_KEY_NAME}'."
     fi
     KEY="$(gcloud services api-keys get-key-string "${KEY_RESOURCE}" \
-      --billing-project="${PROJECT}" --format='value(keyString)')"
+      --billing-project="${PROJECT}" --format='value(keyString)' --quiet)"
   fi
 
   note "Testing the key against Google's test phishing page (a new key can take a minute)..."
