@@ -1,0 +1,7 @@
+functions-framework>=3.8.0
+cloudevents>=1.11.0
+google-cloud-datastore>=2.19.0
+google-cloud-pubsub>=2.21.0
+google-api-python-client>=2.126.0
+google-auth>=2.29.0
+tldextract>=5.1.2

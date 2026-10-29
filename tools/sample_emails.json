@@ -1,0 +1,90 @@
+[
+  {
+    "id": "msg-phish-001",
+    "expectedVerdict": "Unsecured",
+    "thesisCategory": "Links, but no attachment",
+    "from": "Microsoft 365 Security <security-alert@m1crosoft-auth-verify.com>",
+    "subject": "URGENT: Your corporate mailbox will be suspended in 2 hours",
+    "date": "Tue, 20 Oct 2026 09:15:00 +0000",
+    "body": "Dear User,\n\nWe detected unauthorized login attempts to your corporate account. To prevent immediate suspension of your email access, please verify your credentials within 2 hours at:\nhttps://login.m1crosoft-auth-verify.com/oauth2/authorize?session=89f4a2c19b83e71d0049a8b7c6d5e4f3&redirect=inbox\n\nFailure to complete verification will result in permanent account lock.\n\nIT Security Helpdesk",
+    "attachmentFilename": null,
+    "attachmentContent": null
+  },
+  {
+    "id": "msg-phish-002",
+    "expectedVerdict": "Unsecured",
+    "thesisCategory": "No attachment and no links",
+    "from": "Chief Executive Officer <ceo.office.urgent@gmail.com>",
+    "subject": "Confidential: Urgent Wire Transfer & Payroll Tax Filing",
+    "date": "Tue, 20 Oct 2026 10:02:00 +0000",
+    "body": "Hi,\n\nI am currently in a board meeting and cannot take calls. I need you to process an urgent confidential wire transfer of $48,500 to our new vendor before 12:00 PM today, and reply directly to this email with the company corporate card details and routing number.\n\nPlease treat this with strict confidentiality and confirm as soon as you see this.",
+    "attachmentFilename": null,
+    "attachmentContent": null
+  },
+  {
+    "id": "msg-phish-003",
+    "expectedVerdict": "Unsecured",
+    "thesisCategory": "Attachment, but no links",
+    "from": "HR Rewards Department <rewards@global-bonus-payouts.net>",
+    "subject": "Congratulations! You have been selected for a $5,000 Q4 Loyalty Grant",
+    "date": "Tue, 20 Oct 2026 11:30:00 +0000",
+    "body": "Congratulations!\n\nYou have been randomly selected to receive an exclusive $5,000 Employee Loyalty Grant. Please review the attached claim instructions and reply with your bank sort code, account number, and National Insurance number to release the funds immediately.",
+    "attachmentFilename": "Claim_Instructions_2026.txt",
+    "attachmentContent": "OFFICIAL REWARD CLAIM FORM\nTo release your $5,000 loyalty bonus within 24 hours, reply with:\n1. Full Legal Name\n2. Online Banking Username & One-Time Passcode\n3. Bank Account & Sort Code\n4. Copy of Passport or Driving Licence"
+  },
+  {
+    "id": "msg-phish-004",
+    "expectedVerdict": "Unsecured",
+    "thesisCategory": "Attachment and links",
+    "from": "DHL Express Customs <customs-clearance@dhl-parcel-track-uk.info>",
+    "subject": "Action Required: Unpaid Customs Duty on Parcel #GB-9948120",
+    "date": "Tue, 20 Oct 2026 12:45:00 +0000",
+    "body": "Your parcel #GB-9948120 is held at our distribution hub due to an unpaid customs fee of £2.99. Please review the attached shipping manifest and submit your credit card payment within 24 hours at https://pay.dhl-parcel-track-uk.info/customs/checkout?id=GB9948120 to avoid return to sender.",
+    "attachmentFilename": "Shipping_Manifest_GB9948120.txt",
+    "attachmentContent": "DHL EXPRESS CUSTOMS NOTICE\nParcel ID: GB-9948120\nStatus: HELD - PAYMENT REQUIRED\nComplete card verification at: https://pay.dhl-parcel-track-uk.info/customs/checkout?id=GB9948120"
+  },
+  {
+    "id": "msg-legit-001",
+    "expectedVerdict": "Secured",
+    "thesisCategory": "No attachment and no links",
+    "from": "Dr. Alex Morgan <a.morgan@university.example>",
+    "subject": "Re: MSc Dissertation Supervision Meeting Tomorrow",
+    "date": "Tue, 20 Oct 2026 13:10:00 +0000",
+    "body": "Hi Goran,\n\nThanks for sending over the draft of Chapter 4. Let's meet tomorrow at 2:00 PM to go through the discussion section.\n\nBest regards,\nAlex",
+    "attachmentFilename": null,
+    "attachmentContent": null
+  },
+  {
+    "id": "msg-legit-002",
+    "expectedVerdict": "Secured",
+    "thesisCategory": "Links, but no attachment",
+    "from": "Google Cloud Platform <CloudPlatform-noreply@google.com>",
+    "subject": "Your Google Cloud billing statement is ready to view",
+    "date": "Tue, 20 Oct 2026 14:00:00 +0000",
+    "body": "Hello,\n\nYour monthly billing statement for project pef-demo-project is now available in the Google Cloud Console. No action is required as automatic payments are enabled.\n\nView your statement in the console: https://console.cloud.google.com/billing\n\nThank you,\nThe Google Cloud Team",
+    "attachmentFilename": null,
+    "attachmentContent": null
+  },
+  {
+    "id": "msg-legit-003",
+    "expectedVerdict": "Secured",
+    "thesisCategory": "Attachment, but no links",
+    "from": "Engineering Team <eng-notes@company.com>",
+    "subject": "Sprint 42 Retrospective Notes",
+    "date": "Tue, 20 Oct 2026 15:20:00 +0000",
+    "body": "Hi everyone,\n\nAttached are the plain-text notes from today's Sprint 42 retrospective. Thanks for a smooth release cycle this week!",
+    "attachmentFilename": "sprint_42_retro_notes.txt",
+    "attachmentContent": "Sprint 42 Retrospective Summary:\n- What went well: Cloud Run Functions migration completed ahead of schedule.\n- Action items: Add unit tests for MIME multipart parsing before next Tuesday."
+  },
+  {
+    "id": "msg-legit-004",
+    "expectedVerdict": "Secured",
+    "thesisCategory": "Attachment and links",
+    "from": "Facilities Team <facilities@example.org>",
+    "subject": "Room booking confirmed: Engineering offsite, 12 November",
+    "date": "Tue, 20 Oct 2026 16:05:00 +0000",
+    "body": "Hi Goran,\n\nYour booking for the Engineering offsite is confirmed. The room plan is attached, and directions to the building are at https://www.example.org/campus/directions.\n\nThanks,\nFacilities Team",
+    "attachmentFilename": "room_plan.txt",
+    "attachmentContent": "Event: Engineering offsite\nRoom: B2.14 (40 seats)\nTime: 09:30 to 16:00\nAV: HDMI + USB-C, video-conferencing kit"
+  }
+]

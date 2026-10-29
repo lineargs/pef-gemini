@@ -1,0 +1,42 @@
+name: PEF v2 CI Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies (google-genai 2.x + Pydantic 2.x)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint setup, deploy and teardown scripts
+        run: |
+          bash -n setup.sh deploy.sh destroy.sh
+          shellcheck setup.sh deploy.sh destroy.sh
+
+      - name: Run unit & integration test suite
+        run: |
+          pytest -v
+
+      - name: Run offline pipeline smoke tests & 2021 dataset replay
+        run: |
+          python tools/simulator.py --mode offline
+          python tools/benchmark.py --mode offline
+          python tools/replay_2021_datasets.py --mode offline
+          python tools/evaluate.py --mode offline --sweep --out "$RUNNER_TEMP/evals"
+          python tools/evaluate.py --replay "$(ls "$RUNNER_TEMP"/evals/*.jsonl | head -1)" --sweep > /dev/null

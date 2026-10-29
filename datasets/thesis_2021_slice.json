@@ -1,0 +1,147 @@
+{
+  "metadata": {
+    "description": "Facts about Goran Minov's 2021 MSc framework (PEF v1), checked against the 2021 source code, the SREday London 2026 slides and the author. Values that could not be confirmed are left out rather than guessed.",
+    "models": [
+      {
+        "name": "PEFURLs",
+        "automl_model_id": "TCN5515297659482537984",
+        "api": "AutoML API v1, Natural Language single-label classification",
+        "used_by": [
+          "emailDomain (sender domain)",
+          "emailLinks (URLs in the body)"
+        ],
+        "dataset": "PhishStorm (Marchal et al., 2014)",
+        "training_rows": 95895,
+        "legitimate_rows": 48004,
+        "phishing_rows": 47891,
+        "held_out_precision_pct_at_095": 99.58,
+        "held_out_recall_pct_at_095": 95.09
+      },
+      {
+        "name": "PEFMessages",
+        "automl_model_id": "TCN1866819011359014912",
+        "api": "AutoML API v1, Natural Language single-label classification",
+        "used_by": [
+          "emailBody (message text)",
+          "newEmailWatch (attachment text)"
+        ],
+        "training_rows": 52162,
+        "legitimate_rows": 31519,
+        "phishing_rows": 20643,
+        "held_out_precision_pct_at_095": 99.41,
+        "held_out_recall_pct_at_095": 98.45
+      }
+    ],
+    "training_hours_total": 12,
+    "pipeline": {
+      "cloud_functions": 8,
+      "runtimes": {
+        "nodejs8": 3,
+        "nodejs10": 5
+      },
+      "email_topics_in_sequence": [
+        "email-watch",
+        "email-domain",
+        "email-links",
+        "email-body",
+        "email-outcome"
+      ],
+      "setup_topics": [
+        "email-labels"
+      ],
+      "thresholds_at_095": {
+        "No attachments and no URLs": {
+          "max_score": 3,
+          "threshold": 1.9
+        },
+        "URLs, but no attachments": {
+          "max_score": 5,
+          "threshold": 2.85
+        },
+        "Attachments, but no URLs": {
+          "max_score": 4,
+          "threshold": 2.85
+        },
+        "Attachments and URLs": {
+          "max_score": 6,
+          "threshold": 3.8
+        }
+      }
+    },
+    "live_trial": {
+      "period": "February to May 2021",
+      "emails": 298,
+      "flagged_phishing": 168,
+      "not_flagged": 130,
+      "note": "These are the framework's verdicts, not ground truth. Which verdicts were correct was not recorded, so the trial has no accuracy figure.",
+      "by_category": [
+        {
+          "category": "No attachments and no URLs",
+          "emails": 67,
+          "flagged_phishing": 33,
+          "not_flagged": 34
+        },
+        {
+          "category": "URLs, but no attachments",
+          "emails": 223,
+          "flagged_phishing": 135,
+          "not_flagged": 88
+        },
+        {
+          "category": "Attachments, but no URLs",
+          "emails": 3,
+          "flagged_phishing": 0,
+          "not_flagged": 3
+        },
+        {
+          "category": "Attachments and URLs",
+          "emails": 5,
+          "flagged_phishing": 0,
+          "not_flagged": 5
+        }
+      ]
+    }
+  },
+  "replay_emails": [
+    {
+      "id": "2021-style-phish-1",
+      "sourceDataset": "synthetic, written in the style of 2021 prize lures",
+      "expectedVerdict": "Unsecured",
+      "from": "PayPal Rewards <rewards@paypa1-billing-verify.com>",
+      "subject": "Congratulations! Claim your £900 prize reward",
+      "body": "Congratulations! Your account has been chosen for a £900 prize reward. Act immediately and verify your account to release the payment:\nhttps://paypa1-billing-verify.com/claim?session=88a1f0c2",
+      "attachmentFilename": null,
+      "attachmentContent": null
+    },
+    {
+      "id": "2021-style-phish-2",
+      "sourceDataset": "synthetic, written in the style of 2021 card-security lures",
+      "expectedVerdict": "Unsecured",
+      "from": "American Express Security <alerts@amex-secure-verify.net>",
+      "subject": "Unusual activity detected on your card",
+      "body": "Dear Cardmember,\n\nAfter unusual activity, your online access has been temporarily restricted. Sign in immediately to verify your identity and restore access:\nhttps://login.amex-secure-verify.net/verify?session=4c1d",
+      "attachmentFilename": null,
+      "attachmentContent": null
+    },
+    {
+      "id": "2021-style-legit-1",
+      "sourceDataset": "synthetic, written in the style of a 2021 course email",
+      "expectedVerdict": "Secured",
+      "from": "Course Office <office@university.example>",
+      "subject": "Reading list for tomorrow's seminar",
+      "body": "Hi everyone,\n\nThe reading for tomorrow's seminar is on the module page, and the EDGAR examples are at https://www.sec.gov/edgar.shtml.\n\nSee you in class.",
+      "attachmentFilename": null,
+      "attachmentContent": null
+    },
+    {
+      "id": "2021-style-legit-2",
+      "sourceDataset": "synthetic, written in the style of a 2021 personal email",
+      "expectedVerdict": "Secured",
+      "from": "Sam <sam@university.example>",
+      "subject": "Lunch today?",
+      "body": "Are you free for lunch at 12:30? The usual place near the library.",
+      "attachmentFilename": null,
+      "attachmentContent": null
+    }
+  ]
+}
