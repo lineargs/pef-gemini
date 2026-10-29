@@ -273,7 +273,8 @@ def _claim_message(ds: Any, message_id: str, now: int | None = None) -> bool:
             claim.update({"status": STATUS_FAILED, "processed": True, "processedAt": now})
             ds.put(claim)
             logger.error(
-                "Message %s failed %d times; parked as `failed` (left labelled Pending).",
+                "PEF_MESSAGE_FAILED: message %s failed %d times; parked as `failed` "
+                "(left labelled Pending).",
                 message_id,
                 attempts,
             )
@@ -488,6 +489,22 @@ def _publish_to_analyze(payload: dict[str, Any]) -> str:
     return future.result(timeout=10)
 
 
+def _is_auth_expired(exc: BaseException) -> bool:
+    """True when Google no longer accepts the stored refresh token.
+
+    That happens when the sign-in expired (7 days in Testing mode), was revoked, or the
+    Google password changed; the fix is to sign in again at the onboarding URL. Logged
+    with the PEF_AUTH_EXPIRED marker, which the alert deploy.sh creates matches on.
+    """
+    if "invalid_grant" in str(exc):
+        return True
+    try:
+        from google.auth.exceptions import RefreshError
+    except ImportError:  # pragma: no cover - google-auth ships with the client libraries
+        return False
+    return isinstance(exc, RefreshError) and not getattr(exc, "retryable", False)
+
+
 @functions_framework.cloud_event
 def email_ingest(cloud_event: Any) -> None:
     """Cloud Run Function entry point triggered by `email-watch` Pub/Sub topic."""
@@ -509,10 +526,23 @@ def email_ingest(cloud_event: Any) -> None:
         return
 
     # Mode 2: Live Gmail Push Notification
+    email = notification["emailAddress"]
+    try:
+        _ingest_mailbox(email, notification.get("historyId"))
+    except Exception as exc:
+        if _is_auth_expired(exc):
+            logger.error(
+                "PEF_AUTH_EXPIRED: the Gmail sign-in for %s has expired or was revoked; "
+                "open the onboarding URL to sign in again.",
+                email,
+            )
+        raise  # Pub/Sub retries; after re-onboarding, a retry goes through.
+
+
+def _ingest_mailbox(email: str, notification_history_id: Any) -> None:
+    """Collect the mailbox's new INBOX messages and publish each one for analysis."""
     from googleapiclient.discovery import build
 
-    email = notification["emailAddress"]
-    notification_history_id = notification.get("historyId")
     ds = _get_datastore_client()
     creds = _load_user_credentials(ds, email)
     gmail = build("gmail", "v1", credentials=creds)

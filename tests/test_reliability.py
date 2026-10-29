@@ -675,5 +675,70 @@ class TestOutcomeStage(unittest.TestCase):
         )
 
 
+class TestAlertMarkers(unittest.TestCase):
+    """The log lines the deploy.sh alerts match on (an expired sign-in, a parked email)."""
+
+    EXPIRED = RuntimeError("('invalid_grant: Token has been expired or revoked.', {'error': 'invalid_grant'})")
+
+    def test_auth_expiry_is_recognised(self) -> None:
+        for module in (auth_main, ingest_main):
+            self.assertTrue(module._is_auth_expired(self.EXPIRED))
+            self.assertFalse(module._is_auth_expired(TimeoutError("read timed out")))
+        try:
+            from google.auth.exceptions import RefreshError
+        except ImportError:
+            self.skipTest("google-auth not installed")
+        transient = RefreshError("Internal Failure", retryable=True)
+        self.assertFalse(ingest_main._is_auth_expired(transient))
+        self.assertTrue(ingest_main._is_auth_expired(RefreshError("Token has been expired or revoked.")))
+
+    def test_watch_renewal_flags_an_expired_sign_in(self) -> None:
+        ds = FakeDatastore()
+        token = datastore.Entity(key=ds.key("OAuthToken", "u@example.com"))
+        token.update({"email": "u@example.com", "token_json": "{}"})
+        ds.query = lambda kind: SimpleNamespace(fetch=lambda: [token])  # type: ignore[attr-defined]
+        creds_mod = ModuleType("google.oauth2.credentials")
+        creds_mod.Credentials = mock.MagicMock()  # type: ignore[attr-defined]
+        creds_mod.Credentials.from_authorized_user_info.side_effect = self.EXPIRED  # type: ignore[attr-defined]
+        oauth2_mod = ModuleType("google.oauth2")
+        oauth2_mod.credentials = creds_mod  # type: ignore[attr-defined]
+        with mock.patch.object(auth_main, "_get_datastore_client", return_value=ds), \
+                mock.patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "p"}), \
+                mock.patch.dict(sys.modules, {"google.oauth2": oauth2_mod, "google.oauth2.credentials": creds_mod}), \
+                self.assertLogs(auth_main.logger, level="ERROR") as logs:
+            body, status, _ = auth_main.auth_renew_watch(None)
+        self.assertEqual(status, 207)
+        self.assertEqual(json.loads(body)["failedCount"], 1)
+        self.assertIn("PEF_AUTH_EXPIRED", logs.output[0])
+
+    def test_ingest_flags_an_expired_sign_in_and_still_retries(self) -> None:
+        with mock.patch.object(ingest_main, "_get_datastore_client", return_value=FakeDatastore()), \
+                mock.patch.object(ingest_main, "_load_user_credentials", side_effect=self.EXPIRED), \
+                mock.patch.dict(os.environ, {"ALLOW_SIMULATED_PAYLOADS": "false"}), \
+                self.assertLogs(ingest_main.logger, level="ERROR") as logs:
+            with self.assertRaises(RuntimeError):  # Pub/Sub redelivers after re-onboarding
+                ingest_main.email_ingest(_gmail_notification_event("u@example.com", "200"))
+        self.assertIn("PEF_AUTH_EXPIRED", logs.output[0])
+
+    def test_parked_message_is_flagged(self) -> None:
+        ds = FakeDatastore()
+        for now in range(ingest_main.MAX_MESSAGE_ATTEMPTS):
+            ingest_main._claim_message(ds, "m1", now=now * 10_000)
+        with self.assertLogs(ingest_main.logger, level="ERROR") as logs:
+            self.assertFalse(ingest_main._claim_message(ds, "m1", now=10**9))
+        self.assertIn("PEF_MESSAGE_FAILED", logs.output[0])
+
+    def test_deploy_alerts_match_the_markers_in_the_code(self) -> None:
+        alerts = (ROOT_DIR / "tools" / "alerts.py").read_text()
+        code = "".join(
+            (ROOT_DIR / "functions" / name / "main.py").read_text()
+            for name in ("auth_setup", "email_ingest")
+        )
+        for marker in ("PEF_AUTH_EXPIRED", "PEF_WATCH_RENEWAL_FAILED", "PEF_MESSAGE_FAILED"):
+            self.assertIn(marker + ":", code)
+            self.assertTrue(marker in alerts, marker)
+        self.assertTrue("num_undelivered_messages" in alerts)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -325,6 +325,22 @@ def auth_callback(request: Any) -> tuple[str, int, dict[str, str]]:
         )
 
 
+def _is_auth_expired(exc: BaseException) -> bool:
+    """True when Google no longer accepts the stored refresh token.
+
+    That happens when the sign-in expired (7 days in Testing mode), was revoked, or the
+    Google password changed; the fix is to sign in again at the onboarding URL. Logged
+    with the PEF_AUTH_EXPIRED marker, which the alert deploy.sh creates matches on.
+    """
+    if "invalid_grant" in str(exc):
+        return True
+    try:
+        from google.auth.exceptions import RefreshError
+    except ImportError:  # pragma: no cover - google-auth ships with the client libraries
+        return False
+    return isinstance(exc, RefreshError) and not getattr(exc, "retryable", False)
+
+
 @functions_framework.http
 def auth_renew_watch(request: Any) -> tuple[str, int, dict[str, str]]:
     """IAM-authenticated HTTP endpoint invoked daily by Cloud Scheduler to renew Gmail watches.
@@ -362,8 +378,15 @@ def auth_renew_watch(request: Any) -> tuple[str, int, dict[str, str]]:
                 )
                 _save_watch_state(email, watch_resp)
                 renewed.append(email)
-            except Exception:
-                logger.exception("Failed to renew Gmail watch for %s", email)
+            except Exception as exc:
+                if _is_auth_expired(exc):
+                    logger.error(
+                        "PEF_AUTH_EXPIRED: the Gmail sign-in for %s has expired or was revoked; "
+                        "open the onboarding URL to sign in again.",
+                        email,
+                    )
+                else:
+                    logger.exception("PEF_WATCH_RENEWAL_FAILED: could not renew the Gmail watch for %s", email)
                 failed.append(email)
 
         return _json_response(
@@ -375,7 +398,7 @@ def auth_renew_watch(request: Any) -> tuple[str, int, dict[str, str]]:
             200 if not failed else 207,
         )
     except Exception:
-        logger.exception("Error in auth_renew_watch")
+        logger.exception("PEF_WATCH_RENEWAL_FAILED: error in auth_renew_watch")
         return _json_response(
             {"status": "error", "message": "Watch renewal failed."},
             500,

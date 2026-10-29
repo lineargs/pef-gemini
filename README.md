@@ -278,7 +278,15 @@ All three Pub/Sub-triggered functions deploy with `--retry`. [`deploy.sh`](deplo
 | `email_analyze` | The model refuses the content (SAFETY, PROHIBITED_CONTENT and similar), and every retry gets the same refusal | Fails closed in one step: the email is scored `Unsecured` with reasoning "Not analysed: the model declined this content" and `geminiBlocked` set in the audit log. Other empty responses (for example `MAX_TOKENS`) raise and are retried. |
 | `email_outcome` | Duplicate Sheets rows, or a duplicate analysis that disagrees leaving both `Secured` and `Unsecured` labels | The audit record is first-writer-wins inside a transaction, so the label, the audit entity and the Sheets row always use the first recorded verdict. The label swap removes `Pending` and the opposite verdict label. The Sheets append is claimed in a transaction (`sheetAppended`, `sheetClaimUntil`), and a 404 on a deleted message is ignored. |
 
-Inspect dead letters with `gcloud pubsub subscriptions pull email-dlq-inspect --limit=10`.
+Nobody has to watch for failures: `deploy.sh` creates three Cloud Monitoring alerts with [`tools/alerts.py`](tools/alerts.py), emailed to `ALERT_EMAIL` (default: the first address in `ALLOWED_EMAILS`; `none` turns them off):
+
+| Alert | Fires when | What to do (also in the email) |
+| :--- | :--- | :--- |
+| **PEF: email in the dead-letter queue** | `email-dlq-inspect` holds any message (metric alert on `num_undelivered_messages`) | Read and clear it with `gcloud pubsub subscriptions pull email-dlq-inspect --limit=10 --auto-ack`, then check the logs. Closes once the subscription is empty. |
+| **PEF: Gmail sign-in needs renewing** | Google rejects the stored refresh token (`invalid_grant`: expired, revoked, password changed; logged as `PEF_AUTH_EXPIRED`) or the daily watch renewal fails (`PEF_WATCH_RENEWAL_FAILED`) | Open the onboarding URL (linked in the email) and sign in again. |
+| **PEF: email could not be scanned** | An email is parked after `PEF_MAX_MESSAGE_ATTEMPTS` (`PEF_MESSAGE_FAILED`); these never reach the dead-letter queue | The email is still labelled `Pending`; the log line names it. |
+
+The two log alerts send at most one email an hour. Alerting policies are free until at least 1 September 2027; after that Google charges $0.35 a month per metric condition (one here).
 
 ---
 
@@ -447,7 +455,7 @@ For numbers about your own mail, use a consented, labelled export of it. `evals/
 - blocked responses raise;
 - Sheets rows are not duplicated on redelivery.
 
-[`tests/test_teardown.py`](tests/test_teardown.py) checks that teardown revokes the stored refresh token before deleting records, keeps the verdict history unless asked, and changes nothing in a dry run. [`tests/test_build_eval_set.py`](tests/test_build_eval_set.py) checks that the benchmark set is balanced, cleaned and reproducible from its seed.
+[`tests/test_teardown.py`](tests/test_teardown.py) checks that teardown revokes the stored refresh token before deleting records, keeps the verdict history unless asked, and changes nothing in a dry run. [`tests/test_build_eval_set.py`](tests/test_build_eval_set.py) checks that the benchmark set is balanced, cleaned and reproducible from its seed. [`tests/test_alerts.py`](tests/test_alerts.py) checks the alert policies, that a re-run updates rather than duplicates them, and that teardown deletes only what carries the `app=pef-gemini` label; `tests/test_reliability.py` also checks that the functions log the markers the alerts match on.
 
 CI installs the real dependencies, so in CI the tests exercise the actual `google-genai`, Pydantic and Datastore code paths. A green run on a bare Python only proves the logic, not the SDK integration.
 
@@ -528,7 +536,8 @@ Optional: a Safe Browsing API key (`SAFE_BROWSING_API_KEY`; the API is for non-c
 - grants `gmail-api-push@system.gserviceaccount.com` publish rights on `email-watch`;
 - deploys all Cloud Run functions, with `--retry` and dead-letter wiring on the event-driven ones;
 - attaches resource labels (`RESOURCE_LABELS`, default `app=pef-gemini,managed-by=deploy-sh`) to the Cloud Run functions, Pub/Sub topics and subscriptions, for cost attribution in Cloud Billing and for `destroy.sh`;
-- creates or updates the daily Cloud Scheduler job `pef-gmail-watch-renewal`.
+- creates or updates the daily Cloud Scheduler job `pef-gmail-watch-renewal`;
+- creates or updates the three Cloud Monitoring alerts described under [Reliability](#4-reliability-retries-dead-letters--idempotency), and an email notification channel for `ALERT_EMAIL`. If this step fails the deploy still completes, with a warning.
 
 ```bash
 gcloud auth application-default login   # used by destroy.sh and the local tools
@@ -549,7 +558,7 @@ gcloud auth application-default set-quota-project YOUR_PROJECT_ID
    gcloud pubsub subscriptions pull email-dlq-inspect --limit=10
    ```
 
-While the app is in **Testing** status, refresh tokens expire after 7 days: open the onboarding URL again to renew access.
+While the app is in **Testing** status, Google expires each sign-in 7 days after consent, and the *Gmail sign-in needs renewing* alert tells you when that happens. To stop it expiring, publish the app: **Google Auth Platform → Audience → Publish app**, then open the onboarding URL once more (the sign-in from Testing still expires on schedule). For your own mailbox you don't need Google's verification: you click through an "unverified app" warning when you sign in, and an unverified app is limited to 100 users over the project's lifetime. The sign-in then lasts until you revoke it, change your Google password, or leave it unused for six months.
 
 ### 6. Teardown (`destroy.sh`)
 
@@ -557,6 +566,7 @@ While the app is in **Testing** status, refresh tokens expire after 7 days: open
 
 1. **Revokes stored Gmail access.** Each onboarded mailbox's `OAuthToken` entity holds a refresh token together with the OAuth client ID and secret, which stays valid even after the Cloud resources are gone. [`tools/teardown_datastore.py`](tools/teardown_datastore.py) stops the mailbox's Gmail push watch, revokes the token at Google and deletes the pipeline's per-user records. This step needs the Python requirements and Application Default Credentials; if it fails, or any token can't be revoked, the script stops before deleting anything else.
 2. Deletes the Cloud Scheduler job, the Cloud Run functions (with their Eventarc triggers), the Pub/Sub subscriptions and topics, the project role bindings and the six service accounts.
+3. Deletes the Cloud Monitoring alerts and the email channel labelled `app=pef-gemini` (an existing channel it reused is left alone).
 
 ```bash
 ./destroy.sh --dry-run       # show the plan only
@@ -578,7 +588,7 @@ It deliberately leaves the Firestore database (and `EmailAuditLog`, unless `--pu
 >
 > **Production OAuth2 Notes**:
 > - Set `ALLOWED_EMAILS` in `.env` to your authorised mailbox address(es); `auth_callback` fails closed when `ALLOWED_EMAILS` is empty.
-> - In Google Cloud Console $\rightarrow$ **Google Auth Platform / OAuth Consent Screen**, apps in **Testing** status issue refresh tokens that expire after 7 days; move the app to **Internal** (Google Workspace) or **In Production** for long-lived refresh tokens (note that external public apps requesting the restricted `gmail.modify` scope require Google OAuth verification).
+> - In Google Cloud Console $\rightarrow$ **Google Auth Platform / OAuth Consent Screen**, apps in **Testing** status issue refresh tokens that expire after 7 days; move the app to **Internal** (Google Workspace) or **In production** for long-lived refresh tokens. Unverified, an app in production shows an "unverified app" warning and is capped at 100 users, which is fine for your own mailboxes; offering it to the public with the restricted `gmail.modify` scope needs Google's OAuth verification.
 
 ---
 

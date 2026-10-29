@@ -10,6 +10,8 @@
 #   4. Cloud Run functions (2nd gen) with --retry, wired to the dead-letter topic
 #      with bounded exponential backoff
 #   5. A daily Cloud Scheduler job that renews the Gmail users.watch subscription
+#   6. Cloud Monitoring alerts, emailed to ALERT_EMAIL: an email in the dead-letter
+#      queue, a Gmail sign-in that needs renewing, an email that could not be scanned
 #
 # Re-run safely after any change: every step checks before it creates.
 # ==============================================================================
@@ -62,6 +64,12 @@ RESOURCE_LABELS="${RESOURCE_LABELS:-app=pef-gemini,managed-by=deploy-sh}"
 # Optional: a service account for Cloud Build. Needed in projects where the default
 # compute service account has no roles (org policy disabling automatic IAM grants).
 BUILD_SERVICE_ACCOUNT="${BUILD_SERVICE_ACCOUNT:-}"
+# Where the Cloud Monitoring alerts go (tools/alerts.py). Defaults to the first address in
+# ALLOWED_EMAILS; ALERT_EMAIL=none skips the alerts.
+ALERT_EMAIL="${ALERT_EMAIL:-${ALLOWED_EMAILS:-}}"
+ALERT_EMAIL="${ALERT_EMAIL%%,*}"
+ALERT_EMAIL="${ALERT_EMAIL// /}"
+if [[ -x .venv/bin/python ]]; then PYTHON="${PYTHON:-.venv/bin/python}"; else PYTHON="${PYTHON:-python3}"; fi
 
 if [[ -z "${GOOGLE_CALLBACK_URL:-}" || "${GOOGLE_CALLBACK_URL}" == *"your-gcp-project-id"* ]]; then
   GOOGLE_CALLBACK_URL="https://${GCP_REGION}-${PROJECT}.cloudfunctions.net/auth_callback"
@@ -141,7 +149,7 @@ APIS=(
   artifactregistry.googleapis.com eventarc.googleapis.com pubsub.googleapis.com
   firestore.googleapis.com datastore.googleapis.com aiplatform.googleapis.com
   gmail.googleapis.com sheets.googleapis.com safebrowsing.googleapis.com
-  cloudscheduler.googleapis.com iam.googleapis.com
+  cloudscheduler.googleapis.com iam.googleapis.com monitoring.googleapis.com logging.googleapis.com
 )
 if [[ "${USE_SECRET_MANAGER}" == "true" ]]; then
   APIS+=(secretmanager.googleapis.com)
@@ -330,8 +338,26 @@ fi
 AUTH_INIT_URL="$(gcloud functions describe auth_init --gen2 --region="${GCP_REGION}" --project="${PROJECT}" \
   --format='value(serviceConfig.uri)')"
 
+# ------------------------------------------------------------------------------
+echo "==> 9. Creating alerts..."
+ALERTS_STATUS="not set up (set ALERT_EMAIL in .env)"
+if [[ -z "${ALERT_EMAIL}" || "${ALERT_EMAIL}" == "none" ]]; then
+  echo "    Skipped: ALERT_EMAIL is empty or 'none'."
+elif ! command -v "${PYTHON}" >/dev/null 2>&1; then
+  echo "    Skipped: no Python found (${PYTHON}); run: python3 tools/alerts.py --help"
+  ALERTS_STATUS="not set up (no Python)"
+elif "${PYTHON}" tools/alerts.py --project="${PROJECT}" --email="${ALERT_EMAIL}" \
+    --onboarding-url="${AUTH_INIT_URL}" --dlq-subscription="${DLQ_SUBSCRIPTION}"; then
+  ALERTS_STATUS="emailed to ${ALERT_EMAIL} (Cloud Monitoring > Alerting)"
+else
+  # The pipeline itself is deployed; don't fail the whole run over the alerts.
+  echo "    WARNING: could not create the alerts (see above). Re-run ./deploy.sh to retry." >&2
+  ALERTS_STATUS="FAILED to set up (see the warning above)"
+fi
+
 echo "==> Deployment complete (labels: ${RESOURCE_LABELS})."
 echo "    OAuth Onboarding URL:   ${AUTH_INIT_URL}"
 echo "    OAuth Redirect URI:     ${GOOGLE_CALLBACK_URL}"
-echo "    Dead-lettered messages: gcloud pubsub subscriptions pull ${DLQ_SUBSCRIPTION} --project=${PROJECT} --limit=10"
+echo "    Alerts:                 ${ALERTS_STATUS}"
+echo "    Dead-lettered messages: gcloud pubsub subscriptions pull ${DLQ_SUBSCRIPTION} --project=${PROJECT} --limit=10 --auto-ack"
 echo "    Teardown:               ./destroy.sh --dry-run   (then ./destroy.sh)"

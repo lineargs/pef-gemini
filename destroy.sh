@@ -9,6 +9,7 @@
 #   3. Cloud Run functions (2nd gen), which also removes their Eventarc triggers
 #   4. Pub/Sub subscriptions and topics
 #   5. IAM bindings and the six least-privilege service accounts
+#   6. Cloud Monitoring alerts and the email channel labelled app=pef-gemini
 #
 # It discovers everything first, prints the plan and asks before deleting anything.
 # Resources are found by name AND by the label app=pef-gemini: anything else in the
@@ -144,6 +145,13 @@ echo "    3. Cloud Run functions:"; list ${FUNCTIONS[@]+"${FUNCTIONS[@]}"}
 echo "    4. Pub/Sub subscriptions:"; list ${SUBSCRIPTIONS[@]+"${SUBSCRIPTIONS[@]}"}
 echo "       Pub/Sub topics:"; list ${TOPICS[@]+"${TOPICS[@]}"}
 echo "    5. Service accounts (and their project role bindings):"; list ${ACCOUNTS[@]+"${ACCOUNTS[@]}"}
+echo "    6. Cloud Monitoring alerts and email channel (label app=${APP_LABEL}):"
+HAS_ALERT_TOOL="false"
+if "${PYTHON}" tools/alerts.py --project="${PROJECT}" --delete --dry-run; then
+  HAS_ALERT_TOOL="true"
+else
+  echo "      (could not list them; delete any \"PEF:\" policies in Cloud Monitoring > Alerting by hand)"
+fi
 echo
 
 if [[ "${DRY_RUN}" == "true" ]]; then
@@ -203,6 +211,11 @@ done
 for account in ${ACCOUNTS[@]+"${ACCOUNTS[@]}"}; do
   gcloud iam service-accounts delete "${account}" --project="${PROJECT}" --quiet
 done
+
+echo "==> 6. Deleting Cloud Monitoring alerts..."
+if [[ "${HAS_ALERT_TOOL}" == "true" ]]; then
+  "${PYTHON}" tools/alerts.py --project="${PROJECT}" --delete
+fi
 
 echo "==> Teardown complete. Still in the project (delete by hand if you no longer need them):"
 if [[ "${PURGE_AUDIT}" == "true" ]]; then
