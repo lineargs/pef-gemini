@@ -77,6 +77,14 @@ Accuracy, token and cost figures for Gemini come only from saved live runs of [`
 
 Each email passes through three Cloud Run functions joined by Pub/Sub topics:
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/pipeline-dark.png">
+  <img alt="PEF v2 pipeline: Gmail push to email-watch, then email_ingest, email_analyze (Safe Browsing v5 and Gemini, no Gmail or Datastore access) and email_outcome through Pub/Sub topics, with Firestore, Google Sheets and the email-dlq dead-letter topic" src="docs/images/pipeline-light.png" width="100%">
+</picture>
+
+<details>
+<summary>Diagram as Mermaid</summary>
+
 ```mermaid
 flowchart TB
     Gmail(["Gmail"]) -->|push| TW[["Pub/Sub: email-watch"]]
@@ -97,7 +105,17 @@ flowchart TB
     TW & TA & TO -.-> DLQ[["Pub/Sub: email-dlq + email-dlq-inspect<br/>after PEF_MAX_DELIVERY_ATTEMPTS"]]
 ```
 
+</details>
+
 Onboarding and watch renewal run separately, before and alongside the pipeline:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/onboarding-dark.png">
+  <img alt="Onboarding and watch renewal: auth_init and auth_callback store the refresh token and create labels and the Gmail watch; Cloud Scheduler calls auth_renew_watch daily with OIDC to renew the 7-day watch" src="docs/images/onboarding-light.png" width="100%">
+</picture>
+
+<details>
+<summary>Diagram as Mermaid</summary>
 
 ```mermaid
 flowchart LR
@@ -108,6 +126,8 @@ flowchart LR
     Renew -->|renew 7-day watch| Gmail
     Renew <--> DS
 ```
+
+</details>
 
 ### Least-Privilege Service Account Isolation
 
