@@ -235,11 +235,12 @@ if ask_yn "Turn on the Safe Browsing check?" y; then
   fi
 
   note "Testing the key against Google's test phishing page (a new key can take a minute)..."
-  BODY='{"client":{"clientId":"pef-gemini","clientVersion":"2.0.0"},"threatInfo":{"threatTypes":["SOCIAL_ENGINEERING","MALWARE"],"platformTypes":["ANY_PLATFORM"],"threatEntryTypes":["URL"],"threatEntries":[{"url":"'"${SB_TEST_URL}"'"}]}}'
   status=""
   for attempt in 1 2 3 4 5 6; do
-    status="$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "${BODY}" \
-      "https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${KEY}" || true)"
+    # Safe Browsing v5 urls:search: a GET with the URL to check as a query parameter.
+    status="$(curl -s -o /dev/null -w '%{http_code}' -G -A 'pef-gemini/2.1' \
+      --data-urlencode "key=${KEY}" --data-urlencode "urls=${SB_TEST_URL}" \
+      "https://safebrowsing.googleapis.com/v5/urls:search" || true)"
     if [[ "${status}" == "200" ]]; then break; fi
     if [[ "${attempt}" -lt 6 ]]; then sleep 10; fi
   done
@@ -276,9 +277,9 @@ if ask_yn "Log every verdict to a Google Sheet?" "${sheet_default}"; then
     :
   else
     note "Create a sheet at https://sheets.new while signed in as the protected mailbox."
-    note "Name its tab Sheet1 and paste this header row into A1 (it fills A1 to H1):"
-    printf '\n%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\n' "Message ID" "Category" "Score" "Verdict" \
-      "Model" "Phishing probability" "Signals" "Reasoning"
+    note "Name its tab Sheet1 and paste this header row into A1 (it fills A1 to I1):"
+    printf '\n%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\n' "Message ID" "Category" "Score" "Verdict" \
+      "Model" "Phishing probability" "Signals" "Reasoning" "Safe Browsing"
     note "If you format it as a table, keep the table to the header row."
     while :; do
       SHEET="$(ask "Sheet URL or ID" "")"

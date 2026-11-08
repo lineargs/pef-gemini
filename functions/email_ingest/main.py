@@ -219,7 +219,7 @@ CLAIM_LEASE_SECONDS = int(os.environ.get("PEF_CLAIM_LEASE_SECONDS", "300"))
 # message cannot block every later message in the mailbox.
 MAX_MESSAGE_ATTEMPTS = int(os.environ.get("PEF_MAX_MESSAGE_ATTEMPTS", "5"))
 # Keep published payloads well under Pub/Sub's 10 MB limit; analyze truncates to the
-# same size before calling Gemini, and the Safe Browsing Lookup API takes <= 500 URLs.
+# same size before calling Gemini, and Safe Browsing checks them in batches of 50 (10 requests at most).
 MAX_TEXT_CHARS = 32_000
 MAX_URLS = 500
 STATUS_PROCESSING = "processing"

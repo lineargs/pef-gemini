@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import urllib.parse
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
@@ -288,12 +289,13 @@ class TestPEFPipeline(unittest.TestCase):
     def test_check_safe_browsing_batch_parses_matched_urls(self) -> None:
         fake_response_body = json.dumps(
             {
-                "matches": [
+                "threats": [
                     {
-                        "threatType": "SOCIAL_ENGINEERING",
-                        "threat": {"url": "https://phish.test/login"},
+                        "url": "https://phish.test/login",
+                        "threatTypes": ["SOCIAL_ENGINEERING"],
                     }
-                ]
+                ],
+                "cacheDuration": "300s",
             }
         ).encode("utf-8")
 
@@ -315,6 +317,20 @@ class TestPEFPipeline(unittest.TestCase):
             self.assertEqual(mock_urlopen.call_count, 1)
             # urlopen gets an explicit TLS context (certifi's bundle), so python.org builds on macOS work
             self.assertIsNotNone(mock_urlopen.call_args.kwargs.get("context"))
+            # v5 urls:search: a GET with repeated `urls` query parameters, no body,
+            # and the client identified by User-Agent.
+            request = mock_urlopen.call_args.args[0]
+            self.assertEqual(request.get_method(), "GET")
+            self.assertIsNone(request.data)
+            self.assertTrue(
+                request.full_url.startswith("https://safebrowsing.googleapis.com/v5/urls:search?")
+            )
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+            self.assertEqual(
+                query["urls"],
+                ["https://legit-sender.com", "https://phish.test/login", "https://example.com"],
+            )
+            self.assertTrue(request.get_header("User-agent").startswith("pef-gemini/"))
             self.assertTrue(check_safe_browsing(["https://phish.test/login"]))
 
     def test_gemini_config_uses_response_schema_low_thinking_and_escapes_delimiters(

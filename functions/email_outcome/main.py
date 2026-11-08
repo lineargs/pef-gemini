@@ -241,6 +241,9 @@ def _record_datastore_audit(
                     outcome_event.get("linksSafeBrowsingHit", False)
                 ),
                 "reputationStatus": outcome_event.get("reputationStatus", ""),
+                "safeBrowsingThreatTypes": ",".join(
+                    outcome_event.get("safeBrowsingThreatTypes") or []
+                ),
                 "geminiModels": ",".join(outcome_event.get("geminiModels") or []),
                 "geminiBlocked": outcome_event.get("geminiBlocked") or "",
                 "geminiEscalationError": outcome_event.get("geminiEscalationError") or "",
@@ -300,11 +303,31 @@ def _model_cell(models: str, escalation_error: str = "") -> str:
     return cell
 
 
-# Sheet columns, in order. Add them as a header row in Sheet1!A1:H1.
+def _safe_browsing_cell(
+    status: str, domain_hit: bool, links_hit: bool, threat_types: str = ""
+) -> str:
+    """Describe the Safe Browsing check for the audit sheet, e.g. 'Match: SOCIAL_ENGINEERING (links)'."""
+    if domain_hit or links_hit:
+        where = ", ".join(
+            label for label, hit in (("sender domain", domain_hit), ("links", links_hit)) if hit
+        )
+        types = ", ".join(t for t in threat_types.split(",") if t) or "threat"
+        return f"Match: {types} ({where})"
+    return {
+        "ok": "No match",
+        "no_urls": "Nothing to check",
+        "disabled": "Off (no API key)",
+        "unavailable": "Not checked (lookup failed)",
+        "error": "Not checked (request rejected)",
+    }.get(status, status or "")
+
+
+# Sheet columns, in order. Add them as a header row in Sheet1!A1:I1.
 # "Phishing probability" is the deciding model's overall_confidence (0 to 1); emails whose
 # first pass fell between 0.20 and 0.88 were escalated.
 SHEET_COLUMNS = (
     "Message ID", "Category", "Score", "Verdict", "Model", "Phishing probability", "Signals", "Reasoning",
+    "Safe Browsing",
 )
 
 
@@ -318,6 +341,7 @@ def _append_to_google_sheet(
     propositions: dict[str, bool] | None = None,
     model: str = "",
     phishing_probability: float | None = None,
+    safe_browsing: str = "",
 ) -> None:
     from googleapiclient.discovery import build
 
@@ -339,12 +363,13 @@ def _append_to_google_sheet(
         round(float(phishing_probability), 2) if phishing_probability is not None else "",
         _sanitize_sheet_cell(active_props),
         _sanitize_sheet_cell(reasoning),
+        _sanitize_sheet_cell(safe_browsing),
     ]
 
     sheets_service = build("sheets", "v4", credentials=creds)
     sheets_service.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range="Sheet1!A1:H1",
+        range="Sheet1!A1:I1",
         valueInputOption="RAW",
         body={
             "majorDimension": "ROWS",
@@ -398,13 +423,14 @@ def email_outcome(cloud_event: Any) -> None:
         os.environ.get("LOG_FULL_REASONING", "false").lower() == "true"
     )
     logger.info(
-        "Verdict for message %s (%s): %s [total=%.2f / %d, sb_hit=%s, props=%s]%s",
+        "Verdict for message %s (%s): %s [total=%.2f / %d, sb_hit=%s, sb_types=%s, props=%s]%s",
         message_id,
         category,
         verdict,
         float(total),
         max_score,
         domain_sb or links_sb,
+        ",".join(outcome_event.get("safeBrowsingThreatTypes") or []) or "none",
         ",".join(active_props) or "none",
         f" — {reasoning}" if log_reasoning else "",
     )
@@ -436,5 +462,11 @@ def email_outcome(cloud_event: Any) -> None:
             propositions=recorded.get("propositions", propositions),
             model=_model_cell(audit.get("geminiModels") or "", audit.get("geminiEscalationError") or ""),
             phishing_probability=recorded.get("overall_confidence"),
+            safe_browsing=_safe_browsing_cell(
+                audit.get("reputationStatus") or "",
+                bool(audit.get("domainSafeBrowsingHit")),
+                bool(audit.get("linksSafeBrowsingHit")),
+                audit.get("safeBrowsingThreatTypes") or "",
+            ),
         )
         _mark_sheet_appended(ds, audit.key.name)

@@ -4,7 +4,7 @@ Triggered by Pub/Sub topic `email-analyze`.
 Replaces the 2021 multi-hop AutoML Natural Language pipeline (emailDomain, emailLinks,
 emailBody, and attachment classification) with a unified Gemini 3.8 Flash
 Structured Output call (`response_schema=PhishingAnalysisResult`, `thinking_level="LOW"`)
-and a batched Google Safe Browsing v4 / Web Risk lookup. Token usage from every Gemini
+and a batched Google Safe Browsing v5 (`urls:search`) lookup. Token usage from every Gemini
 call is attached to the outcome event so cost per email can be measured, not estimated.
 
 Security Isolation Note:
@@ -15,7 +15,7 @@ Even under a theoretical model compromise, Stage 2 cannot read or modify the use
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import logging
 import os
@@ -24,6 +24,7 @@ import ssl
 import time
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 
 try:
@@ -250,21 +251,26 @@ class ReputationResult:
     domain_hit: bool
     links_hit: bool
     status: str
+    # Safe Browsing threat types that matched (e.g. SOCIAL_ENGINEERING), sorted.
+    threat_types: list[str] = field(default_factory=list)
 
 
 def _safe_browsing_fail_closed() -> bool:
     return os.environ.get("SAFE_BROWSING_FAIL_CLOSED", "true").lower() == "true"
 
 
-def _query_safe_browsing_matches(urls_to_check: list[str]) -> tuple[set[str], str]:
-    """Query Google Safe Browsing Lookup API v4.
+def _query_safe_browsing_matches(
+    urls_to_check: list[str],
+) -> tuple[dict[str, set[str]], str]:
+    """Query the Google Safe Browsing v5 `urls:search` API.
 
-    Returns (matched_urls, reputation_status). On lookup failure, raises
+    Returns (matches, reputation_status), where `matches` maps each input URL or domain
+    that matched to the set of threat types reported for it. On lookup failure, raises
     SafeBrowsingUnavailableError when SAFE_BROWSING_FAIL_CLOSED=true (default), otherwise
-    returns an empty match set with status `unavailable`.
+    returns no matches with status `unavailable`.
 
-    Note: Safe Browsing v4 is licensed for personal/non-commercial evaluation.
-    For commercial SMB deployments, swap the endpoint to Google Cloud Web Risk API
+    Note: the Safe Browsing API is for non-commercial use only. For commercial
+    deployments, use the Google Cloud Web Risk API instead
     (`https://webrisk.googleapis.com/v1/uris:search`).
     """
     global _warned_reputation_disabled
@@ -278,14 +284,16 @@ def _query_safe_browsing_matches(urls_to_check: list[str]) -> tuple[set[str], st
                 "DISABLED and verdicts rely on Gemini alone."
             )
             _warned_reputation_disabled = True
-        return set(), REPUTATION_DISABLED
+        return {}, REPUTATION_DISABLED
     if not valid_urls:
-        return set(), REPUTATION_NO_URLS
+        return {}, REPUTATION_NO_URLS
 
-    matched: set[str] = set()
+    matched: dict[str, set[str]] = {}
     try:
         for i in range(0, len(valid_urls), SAFE_BROWSING_BATCH_SIZE):
-            matched |= _safe_browsing_lookup(api_key, valid_urls[i : i + SAFE_BROWSING_BATCH_SIZE])
+            batch = valid_urls[i : i + SAFE_BROWSING_BATCH_SIZE]
+            for url, types in _safe_browsing_lookup(api_key, batch).items():
+                matched.setdefault(url, set()).update(types)
         return matched, REPUTATION_OK
     except urllib.error.HTTPError as exc:
         if 400 <= exc.code < 500 and exc.code != 429:
@@ -295,13 +303,15 @@ def _query_safe_browsing_matches(urls_to_check: list[str]) -> tuple[set[str], st
                 "reputation check. Fix SAFE_BROWSING_API_KEY / API enablement.",
                 exc.code,
             )
-            return set(), REPUTATION_ERROR
+            return {}, REPUTATION_ERROR
         return _reputation_unavailable(exc)
     except Exception as exc:
         return _reputation_unavailable(exc)
 
 
-SAFE_BROWSING_BATCH_SIZE = 500  # Lookup API maximum threatEntries per request
+SAFE_BROWSING_ENDPOINT = "https://safebrowsing.googleapis.com/v5/urls:search"
+SAFE_BROWSING_BATCH_SIZE = 50  # urls:search accepts at most 50 URLs per request
+SAFE_BROWSING_USER_AGENT = "pef-gemini/2.1"  # v5 identifies clients by User-Agent
 
 
 _TLS_CONTEXT: ssl.SSLContext | None = None
@@ -325,37 +335,169 @@ def _tls_context() -> ssl.SSLContext:
     return _TLS_CONTEXT
 
 
-def _safe_browsing_lookup(api_key: str, urls: list[str]) -> set[str]:
-    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
-    body = {
-        "client": {"clientId": "pef-gemini", "clientVersion": "2.0.0"},
-        "threatInfo": {
-            "threatTypes": [
-                "MALWARE",
-                "SOCIAL_ENGINEERING",
-                "UNWANTED_SOFTWARE",
-                "POTENTIALLY_HARMFUL_APPLICATION",
-            ],
-            "platformTypes": ["ANY_PLATFORM"],
-            "threatEntryTypes": ["URL"],
-            "threatEntries": [{"url": u} for u in urls],
-        },
-    }
+def _sb_request_url(value: str) -> str:
+    """Turn a bare sender domain into a URL; full URLs are sent as they are."""
+    return value if "://" in value else f"http://{value.strip('/')}/"
+
+
+def _sb_host_path(url: str) -> tuple[str, str]:
+    if "://" not in url:
+        url = f"http://{url}"
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").rstrip(".").lower()
+    path = parts.path or "/"
+    if parts.query:
+        path += f"?{parts.query}"
+    return host, path
+
+
+def _threat_covers(threat_url: str, request_url: str) -> bool:
+    """True if a reported threat URL is one of the request URL's lookup expressions.
+
+    urls:search checks host-suffix and path-prefix expressions of each URL, so a match
+    can come back as e.g. `evil.example/` for a request of `https://a.evil.example/x`.
+    """
+    threat_host, threat_path = _sb_host_path(threat_url)
+    req_host, req_path = _sb_host_path(request_url)
+    if not threat_host:
+        return False
+    if req_host != threat_host and not req_host.endswith(f".{threat_host}"):
+        return False
+    req_path_no_query = req_path.split("?", 1)[0]
+    if threat_path in ("/", req_path, req_path_no_query):
+        return True
+    return threat_path.endswith("/") and req_path_no_query.startswith(threat_path)
+
+
+# v5 ThreatType enum (google.security.safebrowsing.v5).
+_THREAT_TYPE_NAMES = {
+    0: "THREAT_TYPE_UNSPECIFIED",
+    1: "MALWARE",
+    2: "SOCIAL_ENGINEERING",
+    3: "UNWANTED_SOFTWARE",
+    4: "POTENTIALLY_HARMFUL_APPLICATION",
+}
+
+
+def _pb_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        if pos >= len(buf) or shift > 63:
+            raise ValueError("truncated varint")
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _pb_fields(buf: bytes) -> list[tuple[int, int, Any]]:
+    """Decode one protobuf message into (field number, wire type, value) tuples."""
+    fields, pos = [], 0
+    while pos < len(buf):
+        key, pos = _pb_varint(buf, pos)
+        number, wire_type = key >> 3, key & 7
+        if number == 0:
+            raise ValueError("invalid field number")
+        if wire_type == 0:
+            value, pos = _pb_varint(buf, pos)
+        elif wire_type == 1:
+            value, pos = buf[pos : pos + 8], pos + 8
+        elif wire_type == 2:
+            length, pos = _pb_varint(buf, pos)
+            value, pos = buf[pos : pos + length], pos + length
+        elif wire_type == 5:
+            value, pos = buf[pos : pos + 4], pos + 4
+        else:
+            raise ValueError(f"unsupported wire type {wire_type}")
+        if pos > len(buf):
+            raise ValueError("truncated field")
+        fields.append((number, wire_type, value))
+    return fields
+
+
+def _pb_packed_varints(buf: bytes) -> list[int]:
+    values, pos = [], 0
+    while pos < len(buf):
+        value, pos = _pb_varint(buf, pos)
+        values.append(value)
+    return values
+
+
+def _parse_search_urls_response(raw: bytes) -> list[dict[str, Any]]:
+    """Parse a urls:search response into [{"url": ..., "threatTypes": [...]}].
+
+    v5 responses are protocol buffers (SearchUrlsResponse: repeated ThreatUrl threats,
+    Duration cache_duration; ThreatUrl: string url, repeated ThreatType threat_types).
+    The urls:search messages are not in the published proto, so each ThreatUrl is found
+    by shape rather than field number: a sub-message with a URL string and enum values.
+    A JSON body is accepted too.
+    """
+    if not raw.strip():
+        return []
+    if raw.lstrip().startswith(b"{"):
+        return list(json.loads(raw.decode("utf-8")).get("threats", []) or [])
+    threats = []
+    for _, wire_type, value in _pb_fields(raw):
+        if wire_type != 2:
+            continue
+        try:
+            sub_fields = _pb_fields(value)
+        except ValueError:
+            continue
+        url, types = None, []
+        for _, sub_type, sub_value in sub_fields:
+            if sub_type == 0:
+                types.append(sub_value)
+            elif sub_type == 2:
+                try:
+                    text = sub_value.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = ""
+                if url is None and text.isprintable() and ("." in text or "/" in text):
+                    url = text
+                    continue
+                try:
+                    types.extend(_pb_packed_varints(sub_value))
+                except ValueError:
+                    pass
+        if url is not None:
+            threats.append({
+                "url": url,
+                "threatTypes": [
+                    _THREAT_TYPE_NAMES.get(t, "THREAT_TYPE_UNSPECIFIED") for t in types
+                ],
+            })
+    return threats
+
+
+def _safe_browsing_lookup(api_key: str, urls: list[str]) -> dict[str, set[str]]:
+    """One urls:search request. Returns {input URL or domain: matched threat types}."""
+    query = [("key", api_key)] + [("urls", _sb_request_url(u)) for u in urls]
     req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        f"{SAFE_BROWSING_ENDPOINT}?{urllib.parse.urlencode(query)}",
+        headers={"User-Agent": SAFE_BROWSING_USER_AGENT},
+        method="GET",
     )
     with urllib.request.urlopen(req, timeout=5.0, context=_tls_context()) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    matches = data.get("matches", [])
-    matched_urls = {
-        m.get("threat", {}).get("url", "") for m in matches if isinstance(m, dict)
-    }
-    if matches and not any(matched_urls):
-        return set(urls)
-    return {u for u in matched_urls if u}
+        raw = resp.read()
+    matched: dict[str, set[str]] = {}
+    for threat in _parse_search_urls_response(raw):
+        if not isinstance(threat, dict):
+            continue
+        types = {t for t in threat.get("threatTypes", []) or [] if isinstance(t, str)}
+        types = types or {"THREAT_TYPE_UNSPECIFIED"}
+        threat_url = str(threat.get("url", ""))
+        hits = [u for u in urls if _threat_covers(threat_url, _sb_request_url(u))]
+        if not hits:
+            # A match we can't map back to an input: treat the whole batch as hit
+            # rather than drop a known threat.
+            logger.warning("Safe Browsing match %r did not map to a request URL", threat_url)
+            hits = list(urls)
+        for u in hits:
+            matched.setdefault(u, set()).update(types)
+    return matched
 
 
 def _reputation_unavailable(exc: Exception) -> tuple[set[str], str]:
@@ -369,22 +511,25 @@ def _reputation_unavailable(exc: Exception) -> tuple[set[str], str]:
         "(SAFE_BROWSING_FAIL_CLOSED=false): %s",
         exc,
     )
-    return set(), REPUTATION_UNAVAILABLE
+    return {}, REPUTATION_UNAVAILABLE
 
 
 def check_safe_browsing(urls_to_check: list[str]) -> bool:
-    """Query Google Safe Browsing Lookup API v4 for malicious URLs/domains."""
+    """Query Google Safe Browsing (v5 urls:search) for malicious URLs/domains."""
     matched, _ = _query_safe_browsing_matches(urls_to_check)
     return bool(matched)
 
 
 def check_reputation(sender_domain: str, urls: list[str]) -> ReputationResult:
-    """Batch-check sender domain and extracted URLs in a single Safe Browsing v4 request."""
+    """Batch-check sender domain and extracted URLs with Safe Browsing v5 (50 per request)."""
     combined = ([sender_domain] if sender_domain else []) + [u for u in urls if u]
     matched, status = _query_safe_browsing_matches(combined)
     domain_hit = bool(sender_domain and sender_domain in matched)
     links_hit = any(u in matched for u in urls if u)
-    return ReputationResult(domain_hit=domain_hit, links_hit=links_hit, status=status)
+    threat_types = sorted({t for types in matched.values() for t in types})
+    return ReputationResult(
+        domain_hit=domain_hit, links_hit=links_hit, status=status, threat_types=threat_types
+    )
 
 
 def check_safe_browsing_batch(
@@ -783,6 +928,7 @@ def email_analyze(cloud_event: Any) -> None:
         links_sb_malicious=reputation.links_hit,
     )
     outcome_payload["reputationStatus"] = reputation.status
+    outcome_payload["safeBrowsingThreatTypes"] = reputation.threat_types
     outcome_payload["geminiModels"] = run.models
     outcome_payload["geminiUsage"] = run.token_totals()
     outcome_payload["geminiBlocked"] = run.blocked_reason

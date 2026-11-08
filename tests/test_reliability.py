@@ -15,6 +15,7 @@ from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
+import urllib.parse
 from unittest import mock
 
 try:
@@ -528,20 +529,116 @@ class TestAnalyzeStage(unittest.TestCase):
             with mock.patch("urllib.request.urlopen", side_effect=_http_error(429)):
                 with self.assertRaises(analyze_main.SafeBrowsingUnavailableError):
                     analyze_main.check_reputation("https://x.org", ["https://x.org/a"])
-            # More than 500 URLs are split into Lookup API-sized batches.
+            # More than 50 URLs are split into urls:search-sized batches.
             ok = mock.MagicMock()
             ok.read.return_value = b"{}"
             ok.__enter__.return_value = ok
-            urls = [f"https://x.org/{i}" for i in range(1_200)]
+            urls = [f"https://x.org/{i}" for i in range(120)]
             with mock.patch("urllib.request.urlopen", return_value=ok) as urlopen:
                 rep = analyze_main.check_reputation("https://x.org", urls)
             self.assertEqual(rep.status, "ok")
+            self.assertEqual(rep.threat_types, [])
             self.assertEqual(urlopen.call_count, 3)
             sizes = [
-                len(json.loads(c.args[0].data)["threatInfo"]["threatEntries"])
+                len(urllib.parse.parse_qs(urllib.parse.urlsplit(c.args[0].full_url).query)["urls"])
                 for c in urlopen.call_args_list
             ]
-            self.assertEqual(sizes, [500, 500, 201])
+            self.assertEqual(sizes, [50, 50, 21])
+
+    @staticmethod
+    def _sb_response(threats: list[dict]) -> mock.MagicMock:
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({"threats": threats, "cacheDuration": "300s"}).encode()
+        resp.__enter__.return_value = resp
+        return resp
+
+    @staticmethod
+    def _pb(field: int, wire_type: int, value: bytes | int) -> bytes:
+        def varint(n: int) -> bytes:
+            out = bytearray()
+            while True:
+                byte, n = n & 0x7F, n >> 7
+                out.append(byte | (0x80 if n else 0))
+                if not n:
+                    return bytes(out)
+        if wire_type == 0:
+            return varint(field << 3) + varint(int(value))
+        return varint(field << 3 | 2) + varint(len(value)) + value
+
+    def test_safe_browsing_v5_protobuf_response(self) -> None:
+        # v5 answers in protobuf: SearchUrlsResponse{threats: ThreatUrl{url, threat_types}, cache_duration}.
+        pb = self._pb
+        threat_1 = pb(1, 2, b"testsafebrowsing.appspot.com/s/phishing.html") + pb(2, 2, bytes([2]))
+        threat_2 = pb(1, 2, b"malware.test/") + pb(2, 0, 1) + pb(2, 0, 3)
+        duration = pb(1, 0, 300)
+        body = pb(1, 2, threat_1) + pb(1, 2, threat_2) + pb(2, 2, duration)
+        self.assertEqual(
+            analyze_main._parse_search_urls_response(body),
+            [
+                {"url": "testsafebrowsing.appspot.com/s/phishing.html", "threatTypes": ["SOCIAL_ENGINEERING"]},
+                {"url": "malware.test/", "threatTypes": ["MALWARE", "UNWANTED_SOFTWARE"]},
+            ],
+        )
+        self.assertEqual(analyze_main._parse_search_urls_response(pb(2, 2, duration)), [])
+        self.assertEqual(analyze_main._parse_search_urls_response(b""), [])
+
+        resp = mock.MagicMock()
+        resp.read.return_value = pb(1, 2, threat_1) + pb(2, 2, duration)
+        resp.__enter__.return_value = resp
+        env = {"SAFE_BROWSING_API_KEY": "k", "SAFE_BROWSING_FAIL_CLOSED": "true"}
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", return_value=resp):
+            rep = analyze_main.check_reputation(
+                "google.com",
+                ["http://testsafebrowsing.appspot.com/s/phishing.html", "https://www.google.com/"],
+            )
+        self.assertEqual((rep.domain_hit, rep.links_hit, rep.status), (False, True, "ok"))
+        self.assertEqual(rep.threat_types, ["SOCIAL_ENGINEERING"])
+
+        # A garbled body is a lookup failure (retried), not a clean result.
+        bad = mock.MagicMock()
+        bad.read.return_value = b"\xff\xff\xff"
+        bad.__enter__.return_value = bad
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", return_value=bad):
+            with self.assertRaises(analyze_main.SafeBrowsingUnavailableError):
+                analyze_main.check_reputation("google.com", ["https://www.google.com/"])
+
+    def test_safe_browsing_v5_maps_expressions_and_threat_types(self) -> None:
+        env = {"SAFE_BROWSING_API_KEY": "k", "SAFE_BROWSING_FAIL_CLOSED": "true"}
+        # urls:search reports host-suffix / path-prefix expressions, not always the URL sent.
+        resp = self._sb_response([
+            {"url": "evil.example/", "threatTypes": ["SOCIAL_ENGINEERING"]},
+            {"url": "malware.test/dl/", "threatTypes": ["MALWARE", "UNWANTED_SOFTWARE"]},
+        ])
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen", return_value=resp) as urlopen:
+            rep = analyze_main.check_reputation(
+                "evil.example",
+                ["https://login.evil.example/verify?id=1", "http://malware.test/dl/app.exe",
+                 "https://malware.test/other", "https://fine.example/"],
+            )
+        self.assertEqual((rep.domain_hit, rep.links_hit, rep.status), (True, True, "ok"))
+        self.assertEqual(rep.threat_types, ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"])
+        # A bare sender domain is sent as a URL.
+        sent = urllib.parse.parse_qs(urllib.parse.urlsplit(urlopen.call_args.args[0].full_url).query)["urls"]
+        self.assertEqual(sent[0], "http://evil.example/")
+        self.assertFalse(analyze_main._threat_covers("malware.test/dl/", "https://malware.test/other"))
+        self.assertFalse(analyze_main._threat_covers("evil.example/", "https://notevil.example/"))
+        self.assertTrue(analyze_main._threat_covers("http://phish.test/login", "https://phish.test/login?x=1"))
+
+        # A clean response is a clean check, not an error.
+        with mock.patch.dict(os.environ, env), mock.patch(
+            "urllib.request.urlopen", return_value=self._sb_response([])
+        ):
+            rep = analyze_main.check_reputation("fine.example", ["https://fine.example/a"])
+        self.assertEqual((rep.domain_hit, rep.links_hit, rep.status, rep.threat_types),
+                         (False, False, "ok", []))
+
+        # A match that can't be mapped back still counts (never silently dropped).
+        with mock.patch.dict(os.environ, env), mock.patch(
+            "urllib.request.urlopen", return_value=self._sb_response([{"threatTypes": ["MALWARE"]}])
+        ):
+            rep = analyze_main.check_reputation("", ["https://a.example/"])
+        self.assertTrue(rep.links_hit)
+        self.assertEqual(rep.threat_types, ["MALWARE"])
 
 
 class TestOutcomeStage(unittest.TestCase):
@@ -555,6 +652,8 @@ class TestOutcomeStage(unittest.TestCase):
             "maxComponentScore": 0.95,
             "geminiAnalysis": {**_phish_result().model_dump()},
             "reputationStatus": "ok",
+            "linksSafeBrowsingHit": True,
+            "safeBrowsingThreatTypes": ["SOCIAL_ENGINEERING"],
             "geminiModels": ["gemini-3.8-flash", "gemini-4-argon"],
             "geminiUsage": {"promptTokens": 800, "outputTokens": 150, "thinkingTokens": 200},
         }
@@ -581,6 +680,8 @@ class TestOutcomeStage(unittest.TestCase):
         self.assertEqual(audit["geminiModels"], "gemini-3.8-flash,gemini-4-argon")
         self.assertEqual(sheet.call_args.kwargs["model"], "gemini-3.8-flash → gemini-4-argon")
         self.assertEqual(sheet.call_args.kwargs["phishing_probability"], 0.97)
+        self.assertEqual(audit["safeBrowsingThreatTypes"], "SOCIAL_ENGINEERING")
+        self.assertEqual(sheet.call_args.kwargs["safe_browsing"], "Match: SOCIAL_ENGINEERING (links)")
 
     def test_sheet_row_names_the_deciding_model(self) -> None:
         self.assertEqual(outcome_main._model_cell("gemini-3.8-flash"), "gemini-3.8-flash")
@@ -596,14 +697,30 @@ class TestOutcomeStage(unittest.TestCase):
                 propositions={"urgency": True, "authority": False},
                 model="gemini-3.8-flash → gemini-4-argon",
                 phishing_probability=0.9666,
+                safe_browsing="Match: SOCIAL_ENGINEERING (links)",
             )
         kwargs = service.spreadsheets().values().append.call_args.kwargs
-        self.assertEqual(kwargs["range"], "Sheet1!A1:H1")
+        self.assertEqual(kwargs["range"], "Sheet1!A1:I1")
         row = kwargs["body"]["values"][0]
         self.assertEqual(len(row), len(outcome_main.SHEET_COLUMNS))
         self.assertEqual(dict(zip(outcome_main.SHEET_COLUMNS, row))["Model"], "gemini-3.8-flash → gemini-4-argon")
         self.assertEqual(dict(zip(outcome_main.SHEET_COLUMNS, row))["Signals"], "urgency")
         self.assertEqual(dict(zip(outcome_main.SHEET_COLUMNS, row))["Phishing probability"], 0.97)
+        self.assertEqual(outcome_main.SHEET_COLUMNS[-1], "Safe Browsing")
+        self.assertEqual(row[-1], "Match: SOCIAL_ENGINEERING (links)")
+
+    def test_safe_browsing_sheet_cell(self) -> None:
+        cell = outcome_main._safe_browsing_cell
+        self.assertEqual(cell("ok", False, True, "MALWARE,SOCIAL_ENGINEERING"),
+                         "Match: MALWARE, SOCIAL_ENGINEERING (links)")
+        self.assertEqual(cell("ok", True, True, "SOCIAL_ENGINEERING"),
+                         "Match: SOCIAL_ENGINEERING (sender domain, links)")
+        self.assertEqual(cell("ok", False, False), "No match")
+        self.assertEqual(cell("no_urls", False, False), "Nothing to check")
+        self.assertEqual(cell("disabled", False, False), "Off (no API key)")
+        self.assertEqual(cell("unavailable", False, False), "Not checked (lookup failed)")
+        self.assertEqual(cell("error", False, False), "Not checked (request rejected)")
+        self.assertEqual(cell("", False, False), "")
 
     def test_function_loggers_emit_info_on_cloud_run(self) -> None:
         # functions-framework sets the root logger to WARNING before loading the module,
